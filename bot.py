@@ -55,30 +55,49 @@ def pct(price) -> str:
         return "-"
 
 
+_TR_CACHE: dict = {}
+
 def tr_sync(text: str) -> str:
     """EN->TR ceviri, basarisiz olursa orijinali dondur.
-    Render IP'si Google'a takildigi icin once MyMemory, sonra Google dene."""
+    Render IP'si Google'a takildigi icin once MyMemory, sonra Google dene.
+    Sonuclar process icinde cache'lenir (kota dostu)."""
     t = (text or "").strip()
     if not t:
         return t
-    t = t[:250]
+    t = t[:140]
+    if t in _TR_CACHE:
+        return _TR_CACHE[t]
     try:
         from deep_translator import MyMemoryTranslator
         out = MyMemoryTranslator(source="en", target="tr").translate(t)
-        if out and out.strip() and "QUERY LENGTH LIMIT" not in out:
-            return out.strip()
+        if out and out.strip() and "QUERY LENGTH LIMIT" not in out and "INVALID" not in out:
+            _TR_CACHE[t] = out.strip()
+            return _TR_CACHE[t]
     except Exception as e:
         log.warning("mymemory ceviri hata: %s", e)
     try:
         from deep_translator.google import GoogleTranslator
-        return GoogleTranslator(source="en", target="tr").translate(t)
+        out = GoogleTranslator(source="en", target="tr").translate(t)
+        _TR_CACHE[t] = (out or t).strip()
+        return _TR_CACHE[t]
     except Exception as e:
         log.warning("google ceviri hata: %s", e)
-        return text.strip()
+        _TR_CACHE[t] = text.strip()[:140]
+        return _TR_CACHE[t]
+
+
+OUT_TR = {
+    "yes": "Evet", "no": "Hayır",
+    "up": "Yukarı", "down": "Aşağı",
+    "over": "Üst", "under": "Alt",
+}
+
+def tr_outcome(o: str) -> str:
+    return OUT_TR.get(str(o).strip().lower(), str(o))
 
 
 def best_prices(m: dict) -> str:
-    """outcomePrices: ["0.62","0.38"] + outcomes: ["Evet","Hayir"] -> 'Evet %62 / Hayir %38'"""
+    """outcomePrices: ["0.62","0.38"] + outcomes: ["Yes","No"] -> 'Evet %62 / Hayır %38'"""
     try:
         outs = m.get("outcomes")
         prcs = m.get("outcomePrices")
@@ -87,7 +106,7 @@ def best_prices(m: dict) -> str:
             outs = json.loads(outs)
         if isinstance(prcs, str):
             prcs = json.loads(prcs)
-        return " / ".join(f"{o} {pct(p)}" for o, p in zip(outs, prcs))
+        return " / ".join(f"{tr_outcome(o)} {pct(p)}" for o, p in zip(outs, prcs))
     except Exception:
         return "-"
 
@@ -95,33 +114,61 @@ def best_prices(m: dict) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Polymarket TR Radar'a hos geldin.\n\n"
-        "/gundem - 24s hacmi en yuksek 10 market\n"
-        "/balina - en yuksek hacimli markette 10k$+ islemler\n"
+        "/gundem - en yuksek hacimli 10 KRIPTO market (Turkce)\n"
+        "/balina - en yuksek hacimli kripto markette 10k$+ islemler\n"
         "/balina <conditionId> - o markette balina islemler\n"
         "/acikla - oran nasil okunur?\n"
         f"{DISCLAIMER}"
     )
 
 
-CRYPTO_KEYS = (
-    "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crypto", "kripto",
-    "xrp", "ripple", "doge", "cardano", "ada", "avax", "avalanche", "chainlink",
-    "bnb", "toncoin", "polkadot", "dot", "matic", "polygon", "arbitrum", "arb",
-    "optimism", "op ", "uniswap", "uni", "litecoin", "ltc", "tron", "trx",
-    "near", "aptos", "apt", "sui", "sei", "pepe", "shib", "fartcoin",
+import re
+
+# Tam kelime eslesmesi (...\b...): "nomination"daki "ton", "whether"daki "eth",
+# "resolution"daki "sol" gibi sahte eslesmeler engellenir.
+CRYPTO_RE = re.compile(
+    r"\b(bitcoin|btc|ethereum|eth|solana|crypto|kripto|xrp|ripple|doge|dogecoin|"
+    r"cardano|avalanche|avax|chainlink|polygon|matic|arbitrum|optimism|uniswap|"
+    r"litecoin|polkadot|near|aptos|sui|sei|pepe|shib|bnb|tron|toncoin|fartcoin|"
+    r"microstrategy|coinbase|binance)\b"
+    r"|\$\s?\d",
+    re.IGNORECASE,
+)
+
+# Bunlar gecerse kripto degildir (etiket crypto demedikce).
+BLOCK_RE = re.compile(
+    r"(nomination|presidential|election|senate|governor|mayor|democrat|republican|"
+    r"putin|xi jinping|pope|oscar|emmy|nfl|nba|super bowl|fed\b|interest rate)",
+    re.IGNORECASE,
 )
 
 
+def _tag_slugs(m: dict) -> str:
+    """tags/categories alanini duzgun parse et, ham JSON copune bakma."""
+    parts = []
+    for key in ("tags", "categories"):
+        v = m.get(key)
+        if isinstance(v, list):
+            for t in v:
+                if isinstance(t, dict):
+                    parts.append(str(t.get("slug", "")))
+                    parts.append(str(t.get("label", "")))
+                    parts.append(str(t.get("name", "")))
+                else:
+                    parts.append(str(t))
+        elif v:
+            parts.append(str(v))
+    return " ".join(parts)
+
+
 def is_crypto(m: dict) -> bool:
-    text = " ".join([
-        str(m.get("question", "")),
-        str(m.get("slug", "")),
-        str(m.get("groupItemTitle", "")),
-        str(m.get("events", "")),
-        str(m.get("tags", "")),
-        str(m.get("categories", "")),
-    ]).lower()
-    return any(k in text for k in CRYPTO_KEYS)
+    tags = _tag_slugs(m).lower()
+    if re.search(r"\bcrypto\b", tags):
+        return True
+    q = f"{m.get('question', '')} {m.get('slug', '')} {m.get('groupItemTitle', '')}"
+    if BLOCK_RE.search(q):
+        return False
+    return bool(CRYPTO_RE.search(q))
 
 
 async def gundem(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -152,6 +199,7 @@ async def gundem(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return 0
 
     crypto = [m for m in markets if is_crypto(m)]
+    log.info("gamma: toplam %d market, kripto filtre %d", len(markets), len(crypto))
     crypto = sorted(crypto, key=vol, reverse=True)[:10]
     if not crypto:
         await update.message.reply_text(
