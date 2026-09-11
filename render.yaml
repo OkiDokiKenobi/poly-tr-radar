@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: poly-tr-radar
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
