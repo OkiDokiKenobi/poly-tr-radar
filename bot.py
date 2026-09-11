@@ -103,11 +103,32 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+CRYPTO_KEYS = (
+    "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crypto", "kripto",
+    "xrp", "ripple", "doge", "cardano", "ada", "avax", "avalanche", "chainlink",
+    "bnb", "toncoin", "polkadot", "dot", "matic", "polygon", "arbitrum", "arb",
+    "optimism", "op ", "uniswap", "uni", "litecoin", "ltc", "tron", "trx",
+    "near", "aptos", "apt", "sui", "sei", "pepe", "shib", "fartcoin",
+)
+
+
+def is_crypto(m: dict) -> bool:
+    text = " ".join([
+        str(m.get("question", "")),
+        str(m.get("slug", "")),
+        str(m.get("groupItemTitle", "")),
+        str(m.get("events", "")),
+        str(m.get("tags", "")),
+        str(m.get("categories", "")),
+    ]).lower()
+    return any(k in text for k in CRYPTO_KEYS)
+
+
 async def gundem(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Gundemi cekiyorum...")
+    await update.message.reply_text("Kripto gundemi cekiyorum...")
     try:
         async with make_client() as c:
-            r = await c.get(f"{GAMMA}/markets", params={"limit": 50, "closed": "false"})
+            r = await c.get(f"{GAMMA}/markets", params={"limit": 200, "closed": "false"})
             r.raise_for_status()
             try:
                 markets = r.json()
@@ -130,8 +151,15 @@ async def gundem(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except (TypeError, ValueError):
             return 0
 
-    top = sorted(markets, key=vol, reverse=True)[:10]
-    lines = ["<b>24s GUNDEM (hacme gore)</b>"]
+    crypto = [m for m in markets if is_crypto(m)]
+    crypto = sorted(crypto, key=vol, reverse=True)[:10]
+    if not crypto:
+        await update.message.reply_text(
+            "Su an ilk 200 markette kripto market bulunamadi. Birazdan tekrar dene." + DISCLAIMER
+        )
+        return
+    top = crypto
+    lines = ["<b>KRIPTO GUNDEM (24s hacme gore)</b>"]
     await update.message.reply_text("Basliklar Turkceye cevriliyor...")
     import asyncio
     for i, m in enumerate(top, 1):
@@ -152,11 +180,11 @@ async def gundem(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def balina(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cond = context.args[0].strip() if context.args else None
     if not cond:
-        # conditionId verilmemisse: en yuksek hacimli marketi bul
-        await update.message.reply_text("En yuksek hacimli market bulunuyor...")
+        # conditionId verilmemisse: en yuksek hacimli KRIPTO marketi bul
+        await update.message.reply_text("En yuksek hacimli kripto market bulunuyor...")
         try:
             async with make_client() as c:
-                r = await c.get(f"{GAMMA}/markets", params={"limit": 20, "closed": "false"})
+                r = await c.get(f"{GAMMA}/markets", params={"limit": 200, "closed": "false"})
                 r.raise_for_status()
                 markets = r.json()
             def vol(m):
@@ -164,7 +192,11 @@ async def balina(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return float(m.get("volume24hr") or 0)
                 except (TypeError, ValueError):
                     return 0
-            top = sorted(markets, key=vol, reverse=True)[0]
+            crypto = sorted([m for m in markets if is_crypto(m)], key=vol, reverse=True)
+            if not crypto:
+                await update.message.reply_text("Su an kripto market bulunamadi." + DISCLAIMER)
+                return
+            top = crypto[0]
             cond = top.get("conditionId")
             q = top.get("question", "-")
         except Exception as e:
