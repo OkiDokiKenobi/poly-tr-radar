@@ -3,9 +3,11 @@ Bahis oynatmaz, para toplamaz, yonlendirme linki vermez.
 Sadece public veri: gundem + balina + aciklama.
 """
 import html
+import json
 import logging
 import os
 import threading
+import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -163,7 +165,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Polymarket TR Radar'a hos geldin.\n\n"
         "/gundem - en yuksek hacimli 10 KRIPTO market (Turkce)\n"
         "/balina - en yuksek hacimli kripto markette 10k$+ islemler\n"
-        "/balina <conditionId> - o markette balina islemler\n"
+        "/takip BTC ETH SOL - sectiklerine otomatik alarm (15 dk)\n"
+        "/listem - takip listen\n"
         "/acikla - oran nasil okunur?\n"
         f"{DISCLAIMER}"
     )
@@ -436,6 +439,203 @@ async def acikla(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+COIN_ALIASES = {
+    "BTC": ["bitcoin", "btc"], "ETH": ["ethereum", "eth"],
+    "SOL": ["solana", "sol"], "XRP": ["xrp", "ripple"],
+    "DOGE": ["doge", "dogecoin"], "ADA": ["cardano", "ada"],
+    "AVAX": ["avax", "avalanche"], "LINK": ["chainlink", "link"],
+    "BNB": ["bnb"], "TON": ["toncoin"], "TRX": ["tron", "trx"],
+    "DOT": ["polkadot", "dot"], "MATIC": ["matic", "polygon"],
+    "ARB": ["arbitrum", "arb"], "OP": ["optimism"],
+    "UNI": ["uniswap", "uni"], "LTC": ["litecoin", "ltc"],
+    "NEAR": ["near"], "APT": ["aptos", "apt"], "SUI": ["sui"],
+    "SEI": ["sei"], "PEPE": ["pepe"], "SHIB": ["shib"],
+    "FARTCOIN": ["fartcoin"],
+}
+
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+ALARM_ESIK_PUAN = 10  # oran degisimi >=10 puan -> alarm
+BALINA_ESIK = 10000  # $ alarm esigi
+
+
+def state_yukle() -> dict:
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            s = json.load(f)
+            if isinstance(s, dict):
+                s.setdefault("chats", {})
+                s.setdefault("seen", {})
+                s.setdefault("last_check", 0)
+                return s
+    except (FileNotFoundError, ValueError):
+        pass
+    except Exception as e:
+        log.warning("state okuma hata: %s", e)
+    return {"chats": {}, "seen": {}, "last_check": 0}
+
+
+def state_kaydet(s: dict):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(s, f, ensure_ascii=False)
+    except Exception as e:
+        log.warning("state yazma hata: %s", e)
+
+
+def coinTemizle(hams: list) -> list:
+    out = []
+    for c in hams:
+        c = "".join(ch for ch in c.upper() if ch.isalnum())
+        if 2 <= len(c) <= 10 and c not in out:
+            out.append(c)
+    return out[:10]
+
+
+def coin_eslesme(m: dict, coin: str) -> bool:
+    takma = COIN_ALIASES.get(coin, [coin.lower()])
+    q = f"{m.get('question', '')} {m.get('slug', '')}"
+    for a in takma:
+        if re.search(r"\b" + re.escape(a) + r"\b", q, re.IGNORECASE):
+            return True
+    return False
+
+
+def ilk_oran(m: dict):
+    try:
+        prcs = m.get("outcomePrices")
+        import json as _j
+        if isinstance(prcs, str):
+            prcs = _j.loads(prcs)
+        return float(prcs[0])
+    except (TypeError, ValueError, IndexError, KeyError):
+        return None
+
+
+async def takip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cid = str(update.effective_chat.id)
+    coinler = coinTemizle(context.args)
+    if not coinler:
+        await update.message.reply_text(
+            "Kullanim: /takip BTC ETH SOL\nBildigin coin sembollerini yaz, 15 dakikada bir kontrol edip degisiklikte mesaj atarim.")
+        return
+    s = state_yukle()
+    mevcut = s["chats"].get(cid, [])
+    for c in coinler:
+        if c not in mevcut:
+            mevcut.append(c)
+    s["chats"][cid] = mevcut[:10]
+    state_kaydet(s)
+    await update.message.reply_text(
+        f"Takip basladi: {', '.join(mevcut)}\n"
+        "15 dakikada bir kontrol edecegim: yeni market, 10k$+ balina, 10+ puan oran degisimi.\n"
+        "Birakmak icin: /birak BTC  |  Liste: /listem" + DISCLAIMER)
+
+
+async def birak(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cid = str(update.effective_chat.id)
+    s = state_yukle()
+    mevcut = s["chats"].get(cid, [])
+    if not context.args:
+        await update.message.reply_text("Kullanim: /birak BTC  veya  /birak hepsi")
+        return
+    if context.args[0].lower() in ("hepsi", "all", "temizle"):
+        s["chats"][cid] = []
+    else:
+        sil = {c.upper() for c in context.args}
+        s["chats"][cid] = [c for c in mevcut if c not in sil]
+    state_kaydet(s)
+    await update.message.reply_text(f"Guncel liste: {', '.join(s['chats'][cid]) or '(bos)'}")
+
+
+async def listem(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cid = str(update.effective_chat.id)
+    s = state_yukle()
+    await update.message.reply_text(
+        f"Takip ettiklerin: {', '.join(s['chats'].get(cid, [])) or '(bos)'}\n"
+        "Ekle: /takip BTC ETH")
+
+
+async def alarm_kontrol(context: ContextTypes.DEFAULT_TYPE):
+    """15 dakikada bir: yeni market + oran degisimi + balina -> push mesaji."""
+    s = state_yukle()
+    aktif = {cid: coins for cid, coins in s["chats"].items() if coins}
+    if not aktif:
+        return
+    sessiz = not s.get("last_check")
+    try:
+        async with make_client() as c:
+            markets = await fetch_crypto_markets(c)
+    except Exception as e:
+        log.warning("alarm fetch hata: %s", e)
+        return
+    if not isinstance(markets, list) or not markets:
+        return
+
+    tum_coinler = sorted({c for coins in aktif.values() for c in coins})
+    coin_market = {}
+    for coin in tum_coinler:
+        eslesen = [m for m in markets if coin_eslesme(m, coin)]
+        coin_market[coin] = sorted(eslesen, key=_vol, reverse=True)[:5]
+
+    for cid, coins in aktif.items():
+        uyari = []
+        for coin in coins:
+            for m in coin_market.get(coin, []):
+                mid = m.get("conditionId") or m.get("slug")
+                if not mid:
+                    continue
+                kayit = s["seen"].get(mid)
+                simdi = ilk_oran(m)
+                if kayit is None:
+                    s["seen"][mid] = {"q": str(m.get("question", ""))[:120], "p": simdi}
+                    if not sessiz:
+                        uyari.append(f"YENI [{coin}] {tr_question(str(m.get('question', '')))[:120]}")
+                elif simdi is not None and kayit.get("p") is not None:
+                    fark = abs(simdi - kayit["p"]) * 100
+                    if fark >= ALARM_ESIK_PUAN:
+                        uyari.append(
+                            f"ORAN [{coin}] %{kayit['p']*100:.0f} -> %{simdi*100:.0f}: "
+                            f"{tr_question(str(m.get('question', '')))[:110]}")
+                        kayit["p"] = simdi
+        # Balina: her coin'in en hacimli marketinde son kontrol sonrasi 10k$+ islem
+        try:
+            async with make_client() as c2:
+                for coin in coins:
+                    top = coin_market.get(coin, [])
+                    if not top:
+                        continue
+                    mid = top[0].get("conditionId")
+                    if not mid:
+                        continue
+                    r = await c2.get(f"{DATA_API}/trades",
+                                     params={"market": mid, "limit": 20})
+                    r.raise_for_status()
+                    for t in r.json():
+                        try:
+                            usd = float(t.get("size") or 0) * float(t.get("price") or 0)
+                            ts = int(t.get("timestamp") or 0)
+                        except (TypeError, ValueError):
+                            continue
+                        if usd >= BALINA_ESIK and ts > s.get("last_check", 0):
+                            uyari.append(
+                                f"BALINA [{coin}] {fmt_usd(usd)} {tr_outcome(t.get('side','-'))} "
+                                f"{tr_outcome(t.get('outcome','-'))} @ {t.get('price')}")
+                            if len([u for u in uyari if u.startswith("BALINA")]) >= 4:
+                                break
+        except Exception as e:
+            log.warning("alarm balina hata: %s", e)
+        if uyari and not sessiz:
+            mesaj = "\n\n".join(uyari[:6])
+            if len(uyari) > 6:
+                mesaj += f"\n\n(+{len(uyari)-6} uyari daha)"
+            try:
+                await context.bot.send_message(chat_id=int(cid), text=mesaj + DISCLAIMER)
+            except Exception as e:
+                log.warning("alarm gonderme hata %s: %s", cid, e)
+    s["last_check"] = int(time.time())
+    state_kaydet(s)
+
+
 def main():
     if not TOKEN:
         raise SystemExit("TELEGRAM_BOT_TOKEN yok. .env dosyasina yaz: TELEGRAM_BOT_TOKEN=xxx")
@@ -464,6 +664,14 @@ def main():
     app.add_handler(CommandHandler("gundem", gundem))
     app.add_handler(CommandHandler("balina", balina))
     app.add_handler(CommandHandler("acikla", acikla))
+    app.add_handler(CommandHandler("takip", takip))
+    app.add_handler(CommandHandler("birak", birak))
+    app.add_handler(CommandHandler("listem", listem))
+    if app.job_queue is None:
+        log.warning("job_queue yok (apscheduler kurulmamis olabilir) - alarmlar calismaz!")
+    else:
+        app.job_queue.run_repeating(alarm_kontrol, interval=900, first=60)
+        log.info("Alarm job kuruldu: 15 dakikada bir")
     log.info("Bot baslatiliyor...")
     app.run_polling()
 
