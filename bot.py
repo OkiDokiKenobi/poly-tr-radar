@@ -1,5 +1,5 @@
 """Coin Radari - takip edilen coinlerde otomatik alarm botu (Faz 1).
-Veri: Binance public API (anahtarsiz). Bahis yok, emir yok, sadece bilgi.
+Veri: OKX public API (anahtarsiz, global). Bahis yok, emir yok, sadece bilgi.
 Alarmlar: fiyat hareketi, hacim patlamasi, likidasyon, fonlama, OI, L/S,
 emir defteri dengesizligi, volatilite sikismasi, blok islem.
 """
@@ -20,7 +20,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-FAPI = "https://fapi.binance.com"
+OKX = "https://www.okx.com"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("coin-radar")
@@ -34,14 +34,14 @@ DISCLAIMER = (
     "\n\nBilgi amacli, yatirim tavsiyesi degil."
 )
 
-# --- coin -> Binance USDT-M futures sembolu ---
+# --- coin -> OKX USDT perpetual sembolu ---
 DESTEKLENEN = ["BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK",
-               "BNB", "TON", "TRX", "DOT", "MATIC", "ARB", "OP", "UNI",
+               "BNB", "TON", "TRX", "DOT", "POL", "ARB", "OP", "UNI",
                "LTC", "NEAR", "APT", "SUI", "SEI", "PEPE", "SHIB"]
 MAJOR = {"BTC", "ETH"}
 
 def sembol(coin: str) -> str:
-    return f"{coin}USDT"
+    return f"{coin}-USDT-SWAP"
 
 # --- hassas esikler ---
 ESIK_15M_MAJOR = 1.0
@@ -69,6 +69,9 @@ def state_yukle() -> dict:
                 s.setdefault("snap", {})
                 s.setdefault("cd", {})
                 s.setdefault("last_check", 0)
+                # eski listelerdeki desteksiz coinleri temizle
+                for cid, coins in s["chats"].items():
+                    s["chats"][cid] = [c for c in coins if c in DESTEKLENEN][:10]
                 return s
     except (FileNotFoundError, ValueError):
         pass
@@ -109,87 +112,99 @@ def cd_ok(s: dict, anahtar: str, simdi: int, sure: int = COOLDOWN) -> bool:
     return False
 
 
-# --- Binance okuma ---
-async def bnc(c: httpx.AsyncClient, yol: str, params: dict):
-    r = await c.get(f"{FAPI}{yol}", params=params)
+# --- OKX okuma ---
+async def ox(c: httpx.AsyncClient, yol: str, params: dict):
+    r = await c.get(f"{OKX}{yol}", params=params)
     r.raise_for_status()
-    return r.json()
+    j = r.json()
+    if str(j.get("code", "")) != "0":
+        raise RuntimeError(f"OKX hata {j.get('code')}: {j.get('msg')}")
+    return j.get("data", [])
+
+
+def okx_mumlar(data: list) -> list:
+    """OKX candles (yeniden eskiye) -> [ts,o,h,l,c,vol] eskiden yeniye."""
+    out = []
+    for k in data:
+        try:
+            out.append([int(k[0]), str(k[1]), str(k[2]), str(k[3]), str(k[4]), str(k[5])])
+        except (TypeError, ValueError, IndexError):
+            continue
+    return list(reversed(out))
+
+
+async def sembol_verisi(c: httpx.AsyncClient, inst: str) -> dict:
+    v = {"inst": inst}
+    try:
+        v["m15"] = okx_mumlar(await ox(c, "/api/v5/market/candles",
+                                       {"instId": inst, "bar": "15m", "limit": "5"}))
+    except Exception as e:
+        log.warning("%s m15 hata: %s", inst, e)
+        v["m15"] = []
+    try:
+        v["h1"] = okx_mumlar(await ox(c, "/api/v5/market/candles",
+                                      {"instId": inst, "bar": "1H", "limit": "14"}))
+    except Exception as e:
+        log.warning("%s h1 hata: %s", inst, e)
+        v["h1"] = []
+    try:
+        fr = await ox(c, "/api/v5/public/funding-rate", {"instId": inst})
+        v["fon"] = float(fr[0]["fundingRate"]) if fr else None
+    except Exception:
+        v["fon"] = None
+    try:
+        oi = await ox(c, "/api/v5/public/open-interest", {"instId": inst})
+        v["oi"] = float(oi[0]["oi"]) if oi else None
+    except Exception:
+        v["oi"] = None
+    try:
+        ls = await ox(c, "/api/v5/rubik/stat/contracts/long-short-account-count",
+                      {"instId": inst, "ccy": "USDT"})
+        v["ls"] = float(ls[-1]["longShortRatio"]) if ls else None
+    except Exception as e:
+        log.warning("%s ls hata: %s", inst, e)
+        v["ls"] = None
+    try:
+        dp = await ox(c, "/api/v5/market/books", {"instId": inst, "sz": "20"})
+        b0 = dp[0] if dp else {}
+        bid = sum(float(px) * float(sz) for px, sz, *_ in b0.get("bids", []))
+        ask = sum(float(px) * float(sz) for px, sz, *_ in b0.get("asks", []))
+        v["defter"] = (bid / ask) if ask > 0 else None
+    except Exception:
+        v["defter"] = None
+    try:
+        lik = await ox(c, "/api/v5/public/liquidation-orders",
+                       {"instId": inst, "mgnMode": "cross", "limit": "100"})
+        v["lik"] = lik[0].get("details", []) if lik else []
+    except Exception as e:
+        log.warning("%s lik hata: %s", inst, e)
+        v["lik"] = []
+    try:
+        v["trd"] = await ox(c, "/api/v5/market/trades", {"instId": inst, "limit": "100"})
+    except Exception:
+        v["trd"] = []
+    return v
 
 
 def mum_degisim(mumlar, adet: int):
-    """Son kapanmis `adet` mumun yuzde degisimi (acilis ilk -> kapanis son)."""
+    """Son kapanmis `adet` mumun yuzde degisimi."""
     try:
-        kapali = [m for m in mumlar if len(m) > 4]
-        if len(kapali) < adet + 1:
+        if len(mumlar) < adet + 1:
             return None
-        ilk_ac = float(kapali[-(adet + 1)][1])
-        son_kap = float(kapali[-1][4])
+        ilk_ac = float(mumlar[-(adet + 1)][1])
+        son_kap = float(mumlar[-1][4])
         return (son_kap - ilk_ac) / ilk_ac * 100
     except (TypeError, ValueError, IndexError):
         return None
 
 
-async def sembol_verisi(c: httpx.AsyncClient, sym: str) -> dict:
-    v = {"sym": sym}
-    try:
-        v["m15"] = await bnc(c, "/fapi/v1/klines", {"symbol": sym, "interval": "15m", "limit": 5})
-    except Exception as e:
-        log.warning("%s m15 hata: %s", sym, e)
-        v["m15"] = []
-    try:
-        v["h1"] = await bnc(c, "/fapi/v1/klines", {"symbol": sym, "interval": "1h", "limit": 14})
-    except Exception as e:
-        log.warning("%s h1 hata: %s", sym, e)
-        v["h1"] = []
-    try:
-        fr = await bnc(c, "/fapi/v1/fundingRate", {"symbol": sym, "limit": 1})
-        v["fon"] = float(fr[0]["fundingRate"]) if fr else None
-    except Exception:
-        v["fon"] = None
-    try:
-        oi = await bnc(c, "/fapi/v1/openInterest", {"symbol": sym})
-        v["oi"] = float(oi.get("openInterest", 0))
-    except Exception:
-        v["oi"] = None
-    try:
-        ls = await bnc(c, "/futures/data/globalLongShortAccountRatio",
-                       {"symbol": sym, "period": "15m", "limit": 2})
-        v["ls"] = float(ls[-1]["longShortRatio"]) if ls else None
-    except Exception:
-        v["ls"] = None
-    try:
-        dp = await bnc(c, "/fapi/v1/depth", {"symbol": sym, "limit": 20})
-        bid = sum(float(b[1]) * float(b[0]) for b in dp.get("bids", []))
-        ask = sum(float(a[1]) * float(a[0]) for a in dp.get("asks", []))
-        v["defter"] = (bid / ask) if ask > 0 else None
-    except Exception:
-        v["defter"] = None
-    try:
-        v["lik"] = await bnc(c, "/fapi/v1/forceOrders", {"symbol": sym, "limit": 100})
-    except Exception as e:
-        log.warning("%s lik hata: %s", sym, e)
-        v["lik"] = []
-    try:
-        v["trd"] = await bnc(c, "/fapi/v1/aggTrades", {"symbol": sym, "limit": 100})
-    except Exception:
-        v["trd"] = []
-    try:
-        mk = await bnc(c, "/fapi/v1/premiumIndex", {"symbol": sym})
-        v["mark"] = float(mk.get("markPrice", 0)) or None
-    except Exception:
-        v["mark"] = None
-    return v
-
-
 def analiz(coin: str, v: dict, snap: dict, simdi: int, ilk_tarama: bool) -> list:
-    """Veriden alarm listesi uret. Ilk taramada sadece kayit, alarm yok."""
     out = []
     major = coin in MAJOR
 
     d15 = mum_degisim(v.get("m15", []), 1)
     d60 = mum_degisim(v.get("h1", []), 4)
 
-    # OI degisimi: snap'teki ~1 saat oncesine gore
     oi = v.get("oi")
     oi_gecmis = snap.get("oi_tarihce", [])
     oi_deg = None
@@ -199,16 +214,7 @@ def analiz(coin: str, v: dict, snap: dict, simdi: int, ilk_tarama: bool) -> list
         oi_gecmis = (oi_gecmis + [oi])[-8:]
     snap["oi_tarihce"] = oi_gecmis
 
-    # Son fiyat (hassas esik karsilastirmasi icin)
-    try:
-        son_fiyat = float(v["h1"][-1][4]) if v.get("h1") else None
-    except (TypeError, ValueError, IndexError):
-        son_fiyat = None
-    snap["fiyat"] = son_fiyat
-
     if ilk_tarama:
-        snap["d15"] = d15
-        snap["d60"] = d60
         return out
 
     esik15 = ESIK_15M_MAJOR if major else ESIK_15M_ALT
@@ -217,21 +223,24 @@ def analiz(coin: str, v: dict, snap: dict, simdi: int, ilk_tarama: bool) -> list
     if d60 is not None and abs(d60) >= ESIK_1S:
         out.append(("fiyat60", f"HAREKET [{coin}] 1 saatte %{d60:+.1f}"))
 
-    # Likidasyon: son 15 dk toplami + long/short ayrimi (mark fiyata gore)
     pencere = simdi * 1000 - 15 * 60 * 1000
     top_lik = long_lik = short_lik = 0.0
     for o in v.get("lik", []) or []:
         try:
-            ts = int(o.get("time", 0))
+            ts = int(o.get("ts", 0))
             if ts < pencere:
                 continue
-            usd = float(o.get("price", 0)) * float(o.get("origQty", 0))
+            usd = float(o.get("px", 0)) * float(o.get("sz", 0))
             top_lik += usd
-            if v.get("mark"):
-                if float(o.get("price", 0)) < v["mark"]:
-                    long_lik += usd
-                else:
-                    short_lik += usd
+            ps = str(o.get("posSide", "")).lower()
+            if ps == "long":
+                long_lik += usd
+            elif ps == "short":
+                short_lik += usd
+            elif str(o.get("side", "")).lower() == "sell":
+                long_lik += usd
+            else:
+                short_lik += usd
         except (TypeError, ValueError):
             continue
     if top_lik >= ESIK_LIK_15M:
@@ -257,7 +266,6 @@ def analiz(coin: str, v: dict, snap: dict, simdi: int, ilk_tarama: bool) -> list
         taraf = "altta alis duvari" if dft >= ESIK_DEFTER else "ustte satis duvari"
         out.append(("defter", f"DEFTER [{coin}] bid/ask {dft:.1f}x — {taraf} (spoof olabilir)"))
 
-    # Volatilite sikismasi: son kapanmis 1s mumu, onceki 12'nin en dari mi?
     try:
         araliklar = []
         for m in v.get("h1", [])[-13:-1]:
@@ -269,11 +277,10 @@ def analiz(coin: str, v: dict, snap: dict, simdi: int, ilk_tarama: bool) -> list
     except (TypeError, ValueError, IndexError):
         pass
 
-    # Blok islem: son 100 aggTrade'de $250K+ tekil
     blok = 0.0
     for t in v.get("trd", []) or []:
         try:
-            usd = float(t.get("p", 0)) * float(t.get("q", 0))
+            usd = float(t.get("px", 0)) * float(t.get("sz", 0))
             if usd >= ESIK_BLOK and usd > blok:
                 blok = usd
         except (TypeError, ValueError):
@@ -281,8 +288,6 @@ def analiz(coin: str, v: dict, snap: dict, simdi: int, ilk_tarama: bool) -> list
     if blok:
         out.append(("blok", f"BLOK [{coin}] tek kalemde {fmt_usd(blok)} emir"))
 
-    snap["d15"] = d15
-    snap["d60"] = d60
     return out
 
 
