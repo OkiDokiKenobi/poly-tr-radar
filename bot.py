@@ -223,22 +223,30 @@ def is_crypto(m: dict) -> bool:
 
 
 async def fetch_crypto_markets(c) -> list:
-    """Once API tarafinda crypto tag + hacim sirasi, olmazsa eski tarama.
-    Dondurdugu liste hacme gore sirali degilse bile cagiran siraliyor."""
-    # 1) Dogru yol: tag + hacim sirasi
-    for params in (
-        {"tag_id": 21, "order": "volume24hr", "ascending": "false",
-         "active": "true", "closed": "false", "limit": 100},
-        {"tag_id": 21, "active": "true", "closed": "false", "limit": 200},
-    ):
-        try:
-            r = await c.get(f"{GAMMA}/markets", params=params)
-            r.raise_for_status()
-            data = r.json()
-            if isinstance(data, list) and data:
-                return data
-        except Exception as e:
-            log.warning("crypto tag fetch hata %s: %s", params, e)
+    """Crypto(21) + Bitcoin(100196) + Ethereum(100383) etiketlerinden hacim
+    sirali cek, conditionId/slug ile tekillestir. Olmazsa eski tarama."""
+    # 1) Dogru yol: tag + hacim sirasi (birden fazla etiket)
+    birlesik: dict = {}
+    for tag in (21, 100196, 100383):
+        for params in (
+            {"tag_id": tag, "order": "volume24hr", "ascending": "false",
+             "active": "true", "closed": "false", "limit": 100},
+            {"tag_id": tag, "active": "true", "closed": "false", "limit": 200},
+        ):
+            try:
+                r = await c.get(f"{GAMMA}/markets", params=params)
+                r.raise_for_status()
+                data = r.json()
+                if isinstance(data, list) and data:
+                    for m in data:
+                        key = m.get("conditionId") or m.get("slug")
+                        if key and key not in birlesik:
+                            birlesik[key] = m
+                    break
+            except Exception as e:
+                log.warning("crypto tag fetch hata %s: %s", params, e)
+    if birlesik:
+        return list(birlesik.values())
     # 2) Yedek: genel tarama + offset'li sayfalama + lokal filtre
     out = []
     for offset in (0, 200, 400):
@@ -256,6 +264,47 @@ async def fetch_crypto_markets(c) -> list:
             log.warning("genel tarama hata offset=%s: %s", offset, e)
             break
     return out
+
+
+def konu(m: dict) -> str:
+    """Cesitlilik icin marketin konusu: bitcoin / ethereum / diger coin / diger."""
+    q = f"{m.get('question', '')} {m.get('slug', '')}".lower()
+    if "bitcoin" in q or re.search(r"\bbtc\b", q):
+        return "bitcoin"
+    if "ethereum" in q or re.search(r"\beth\b", q):
+        return "ethereum"
+    return "altcoin"
+
+
+def _vol(m: dict) -> float:
+    try:
+        return float(m.get("volume24hr") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def cesitlendir(markets: list, adet: int = 10) -> list:
+    """Hacme gore sirali listeden BTC'yi en fazla 4 al, kalan kontenjani
+    altcoin/ethereum ile doldur. Hepsi BTC olmasin."""
+    sirali = sorted(markets, key=_vol, reverse=True)
+    secilen, btc = [], 0
+    for m in sirali:
+        if konu(m) == "bitcoin":
+            if btc >= 4:
+                continue
+            btc += 1
+        secilen.append(m)
+        if len(secilen) >= adet:
+            break
+    # Kontenjan dolmazsa BTC kisitini kaldirip tamamla
+    if len(secilen) < adet:
+        ids = {id(m) for m in secilen}
+        for m in sirali:
+            if id(m) not in ids:
+                secilen.append(m)
+                if len(secilen) >= adet:
+                    break
+    return secilen
 
 
 async def gundem(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -282,8 +331,7 @@ async def gundem(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     crypto = [m for m in markets if is_crypto(m)] or markets
     log.info("gamma: toplam %d market, kripto filtre %d", len(markets), len([m for m in markets if is_crypto(m)]))
-    crypto = sorted(crypto, key=vol, reverse=True)[:10]
-    top = crypto
+    top = cesitlendir(crypto, 10)
     lines = ["<b>KRIPTO GUNDEM (24s hacme gore)</b>"]
     import asyncio
     for i, m in enumerate(top, 1):
