@@ -56,15 +56,25 @@ def pct(price) -> str:
 
 
 def tr_sync(text: str) -> str:
-    """EN->TR ceviri, basarisiz olursa orijinali dondur."""
+    """EN->TR ceviri, basarisiz olursa orijinali dondur.
+    Render IP'si Google'a takildigi icin once MyMemory, sonra Google dene."""
     t = (text or "").strip()
     if not t:
         return t
+    t = t[:250]
+    try:
+        from deep_translator import MyMemoryTranslator
+        out = MyMemoryTranslator(source="en", target="tr").translate(t)
+        if out and out.strip() and "QUERY LENGTH LIMIT" not in out:
+            return out.strip()
+    except Exception as e:
+        log.warning("mymemory ceviri hata: %s", e)
     try:
         from deep_translator.google import GoogleTranslator
-        return GoogleTranslator(source="en", target="tr").translate(t[:300])
-    except Exception:
-        return t
+        return GoogleTranslator(source="en", target="tr").translate(t)
+    except Exception as e:
+        log.warning("google ceviri hata: %s", e)
+        return text.strip()
 
 
 def best_prices(m: dict) -> str:
