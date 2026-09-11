@@ -162,8 +162,12 @@ def _tag_slugs(m: dict) -> str:
 
 
 def is_crypto(m: dict) -> bool:
+    # API zaten crypto etiketiyle verdiyse sorgusuz kabul (siyaset-kripto kesisimleri
+    # "Trump crypto reserve" gibi sorular BLOCK_RE'ye takilmamali).
     tags = _tag_slugs(m).lower()
     if re.search(r"\bcrypto\b", tags):
+        return True
+    if re.search(r"\b(bitcoin|ethereum)\b", tags):
         return True
     q = f"{m.get('question', '')} {m.get('slug', '')} {m.get('groupItemTitle', '')}"
     if BLOCK_RE.search(q):
@@ -171,19 +175,50 @@ def is_crypto(m: dict) -> bool:
     return bool(CRYPTO_RE.search(q))
 
 
+async def fetch_crypto_markets(c) -> list:
+    """Once API tarafinda crypto tag + hacim sirasi, olmazsa eski tarama.
+    Dondurdugu liste hacme gore sirali degilse bile cagiran siraliyor."""
+    # 1) Dogru yol: tag + hacim sirasi
+    for params in (
+        {"tag_id": 21, "order": "volume24hr", "ascending": "false",
+         "active": "true", "closed": "false", "limit": 100},
+        {"tag_id": 21, "active": "true", "closed": "false", "limit": 200},
+    ):
+        try:
+            r = await c.get(f"{GAMMA}/markets", params=params)
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, list) and data:
+                return data
+        except Exception as e:
+            log.warning("crypto tag fetch hata %s: %s", params, e)
+    # 2) Yedek: genel tarama + offset'li sayfalama + lokal filtre
+    out = []
+    for offset in (0, 200, 400):
+        try:
+            r = await c.get(f"{GAMMA}/markets", params={
+                "closed": "false", "limit": 200, "offset": offset})
+            r.raise_for_status()
+            data = r.json()
+            if not isinstance(data, list) or not data:
+                break
+            out.extend(data)
+            if len(data) < 200:
+                break
+        except Exception as e:
+            log.warning("genel tarama hata offset=%s: %s", offset, e)
+            break
+    return out
+
+
 async def gundem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Kripto gundemi cekiyorum...")
     try:
         async with make_client() as c:
-            r = await c.get(f"{GAMMA}/markets", params={"limit": 200, "closed": "false"})
-            r.raise_for_status()
-            try:
-                markets = r.json()
-            except Exception:
-                body = (r.text or "")[:200]
-                log.error("gamma JSON degil: status=%s ctype=%s body=%r", r.status_code, r.headers.get("content-type"), body)
+            markets = await fetch_crypto_markets(c)
+            if not isinstance(markets, list) or not markets:
                 await update.message.reply_text(
-                    f"API su an duz metin dondu (status {r.status_code}). 1 dk sonra tekrar dene.\nDetay: {body}"
+                    "API su an bosa dondu. 1 dk sonra tekrar dene." + DISCLAIMER
                 )
                 return
     except Exception as e:
@@ -198,14 +233,9 @@ async def gundem(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except (TypeError, ValueError):
             return 0
 
-    crypto = [m for m in markets if is_crypto(m)]
-    log.info("gamma: toplam %d market, kripto filtre %d", len(markets), len(crypto))
+    crypto = [m for m in markets if is_crypto(m)] or markets
+    log.info("gamma: toplam %d market, kripto filtre %d", len(markets), len([m for m in markets if is_crypto(m)]))
     crypto = sorted(crypto, key=vol, reverse=True)[:10]
-    if not crypto:
-        await update.message.reply_text(
-            "Su an ilk 200 markette kripto market bulunamadi. Birazdan tekrar dene." + DISCLAIMER
-        )
-        return
     top = crypto
     lines = ["<b>KRIPTO GUNDEM (24s hacme gore)</b>"]
     await update.message.reply_text("Basliklar Turkceye cevriliyor...")
@@ -232,15 +262,14 @@ async def balina(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("En yuksek hacimli kripto market bulunuyor...")
         try:
             async with make_client() as c:
-                r = await c.get(f"{GAMMA}/markets", params={"limit": 200, "closed": "false"})
-                r.raise_for_status()
-                markets = r.json()
+                markets = await fetch_crypto_markets(c)
             def vol(m):
                 try:
                     return float(m.get("volume24hr") or 0)
                 except (TypeError, ValueError):
                     return 0
-            crypto = sorted([m for m in markets if is_crypto(m)], key=vol, reverse=True)
+            filt = [m for m in markets if is_crypto(m)] or markets
+            crypto = sorted(filt, key=vol, reverse=True)
             if not crypto:
                 await update.message.reply_text("Su an kripto market bulunamadi." + DISCLAIMER)
                 return
