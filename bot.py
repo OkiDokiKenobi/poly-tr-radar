@@ -55,6 +55,18 @@ def pct(price) -> str:
         return "-"
 
 
+def tr_sync(text: str) -> str:
+    """EN->TR ceviri, basarisiz olursa orijinali dondur."""
+    t = (text or "").strip()
+    if not t:
+        return t
+    try:
+        from deep_translator.google import GoogleTranslator
+        return GoogleTranslator(source="en", target="tr").translate(t[:300])
+    except Exception:
+        return t
+
+
 def best_prices(m: dict) -> str:
     """outcomePrices: ["0.62","0.38"] + outcomes: ["Evet","Hayir"] -> 'Evet %62 / Hayir %38'"""
     try:
@@ -110,8 +122,12 @@ async def gundem(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     top = sorted(markets, key=vol, reverse=True)[:10]
     lines = ["<b>24s GUNDEM (hacme gore)</b>"]
+    await update.message.reply_text("Basliklar Turkceye cevriliyor...")
+    import asyncio
     for i, m in enumerate(top, 1):
-        q = html.escape(str(m.get("question", "-"))[:120])
+        raw_q = str(m.get("question", "-"))[:200]
+        tr_q = await asyncio.to_thread(tr_sync, raw_q)
+        q = html.escape(tr_q[:150])
         slug = m.get("slug", "")
         link = f"https://polymarket.com/market/{slug}" if slug else "-"
         lines.append(
