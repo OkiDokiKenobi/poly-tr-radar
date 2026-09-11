@@ -1,6 +1,7 @@
-"""Polymarket TR Radar - bilgi amacli Telegram botu (MVP).
-Bahis oynatmaz, para toplamaz, yonlendirme linki vermez.
-Sadece public veri: gundem + balina + aciklama.
+"""Coin Radari - takip edilen coinlerde otomatik alarm botu (Faz 1).
+Veri: Binance public API (anahtarsiz). Bahis yok, emir yok, sadece bilgi.
+Alarmlar: fiyat hareketi, hacim patlamasi, likidasyon, fonlama, OI, L/S,
+emir defteri dengesizligi, volatilite sikismasi, blok islem.
 """
 import html
 import json
@@ -19,23 +20,69 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-GAMMA = "https://gamma-api.polymarket.com"
-DATA_API = "https://data-api.polymarket.com"
+FAPI = "https://fapi.binance.com"
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("poly-tr")
+log = logging.getLogger("coin-radar")
 
-# Not: Bazı ev/ofis ağlarında antivirüs veya proxy self-signed sertifika basar,
-# Python doğrulayamaz. Public okuma için doğrulamayı esnetiyoruz.
-HEADERS = {"User-Agent": "PolyTR-Radar/1.0 (+telegram bot, info only)"}
+HEADERS = {"User-Agent": "CoinRadar/1.0 (+telegram bot, info only)"}
 
 def make_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=20, verify=False, headers=HEADERS, follow_redirects=True)
 
 DISCLAIMER = (
-    "\n\nBilgi amacli, yatirim tavsiyesi degil. "
-    "Turkiye'de lisanssiz bahis oynatma/imkan saglama suctur, bu bot bahis oynatmaz."
+    "\n\nBilgi amacli, yatirim tavsiyesi degil."
 )
+
+# --- coin -> Binance USDT-M futures sembolu ---
+DESTEKLENEN = ["BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK",
+               "BNB", "TON", "TRX", "DOT", "MATIC", "ARB", "OP", "UNI",
+               "LTC", "NEAR", "APT", "SUI", "SEI", "PEPE", "SHIB"]
+MAJOR = {"BTC", "ETH"}
+
+def sembol(coin: str) -> str:
+    return f"{coin}USDT"
+
+# --- hassas esikler ---
+ESIK_15M_MAJOR = 1.0
+ESIK_15M_ALT = 1.5
+ESIK_1S = 2.0
+ESIK_LIK_15M = 500_000
+ESIK_FON = 0.0003
+ESIK_OI_1S = 3.0
+ESIK_LS_YUKSEK = 2.5
+ESIK_LS_DUSUK = 0.4
+ESIK_DEFTER = 2.0
+ESIK_BLOK = 250_000
+COOLDOWN = 45 * 60  # ayni coin+tip icin 45 dk
+GECE_BAS, GECE_BIT = 23, 5  # UTC; bu saatlerde sadece cok buyuk olay
+
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+
+
+def state_yukle() -> dict:
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            s = json.load(f)
+            if isinstance(s, dict):
+                s.setdefault("chats", {})
+                s.setdefault("snap", {})
+                s.setdefault("cd", {})
+                s.setdefault("last_check", 0)
+                return s
+    except (FileNotFoundError, ValueError):
+        pass
+    except Exception as e:
+        log.warning("state okuma hata: %s", e)
+    return {"chats": {}, "snap": {}, "cd": {}, "last_check": 0}
+
+
+def state_kaydet(s: dict):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(s, f, ensure_ascii=False)
+    except Exception as e:
+        log.warning("state yazma hata: %s", e)
 
 
 def fmt_usd(x) -> str:
@@ -50,499 +97,242 @@ def fmt_usd(x) -> str:
     return f"${v:.0f}"
 
 
-def pct(price) -> str:
-    try:
-        return f"%{float(price)*100:.0f}"
-    except (TypeError, ValueError):
-        return "-"
+def gece_mi() -> bool:
+    h = datetime.now(timezone.utc).hour
+    return h >= GECE_BAS or h < GECE_BIT
 
 
-_TR_CACHE: dict = {}
-
-def tr_sync(text: str) -> str:
-    """EN->TR ceviri, basarisiz olursa orijinali dondur.
-    Render IP'si Google'a takildigi icin once MyMemory, sonra Google dene.
-    Sonuclar process icinde cache'lenir (kota dostu)."""
-    t = (text or "").strip()
-    if not t:
-        return t
-    t = t[:140]
-    if t in _TR_CACHE:
-        return _TR_CACHE[t]
-    try:
-        from deep_translator import MyMemoryTranslator
-        out = MyMemoryTranslator(source="en", target="tr").translate(t)
-        if out and out.strip() and "QUERY LENGTH LIMIT" not in out and "INVALID" not in out:
-            _TR_CACHE[t] = out.strip()
-            return _TR_CACHE[t]
-    except Exception as e:
-        log.warning("mymemory ceviri hata: %s", e)
-    try:
-        from deep_translator.google import GoogleTranslator
-        out = GoogleTranslator(source="en", target="tr").translate(t)
-        _TR_CACHE[t] = (out or t).strip()
-        return _TR_CACHE[t]
-    except Exception as e:
-        log.warning("google ceviri hata: %s", e)
-        _TR_CACHE[t] = text.strip()[:140]
-        return _TR_CACHE[t]
-
-
-OUT_TR = {
-    "yes": "Evet", "no": "Hayır",
-    "up": "Yukarı", "down": "Aşağı",
-    "over": "Üst", "under": "Alt",
-    "buy": "ALIŞ", "sell": "SATIŞ",
-}
-
-def tr_outcome(o: str) -> str:
-    return OUT_TR.get(str(o).strip().lower(), str(o))
-
-
-AYLAR = {
-    "january": "Ocak", "february": "Şubat", "march": "Mart", "april": "Nisan",
-    "may": "Mayıs", "june": "Haziran", "july": "Temmuz", "august": "Ağustos",
-    "september": "Eylül", "october": "Ekim", "november": "Kasım", "december": "Aralık",
-}
-
-def tr_tarih(s: str) -> str:
-    t = (s or "").strip().rstrip("?")
-    for en, tr in AYLAR.items():
-        t = re.sub(en, tr, t, flags=re.IGNORECASE)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-
-def tr_question(q: str) -> str:
-    """Kripto tahmin sorularini kalip-eslesmeyle yerelde Turkcelestir (kotasiz).
-    Eslesmezse API cevirisine duser (senkron cagrilamaz -> orijinali dondur)."""
-    s = (q or "").strip()
-    m = re.match(
-        r"will\s+(.+?)\s+(reach|hit)\s+\$\s?([\d,\.]+)\s+(by|in|on)\s+(.+?)\??$",
-        s, re.IGNORECASE)
-    if m:
-        subj, _, sayi, _, tarih = m.groups()
-        return f"{subj.strip().title()} {tr_tarih(tarih)} itibarıyla ${sayi} seviyesine ulaşacak mı?"
-    m = re.match(
-        r"will\s+(.+?)\s+dip to\s+\$\s?([\d,\.]+)\s+by\s+(.+?)\??$",
-        s, re.IGNORECASE)
-    if m:
-        subj, sayi, tarih = m.groups()
-        return f"{subj.strip().title()} {tr_tarih(tarih)} itibarıyla ${sayi} seviyesine düşecek mi?"
-    m = re.match(
-        r"will the price of\s+(.+?)\s+be\s+(above|below)\s+\$\s?([\d,\.]+)\s+on\s+(.+?)\??$",
-        s, re.IGNORECASE)
-    if m:
-        subj, yon, sayi, tarih = m.groups()
-        yw = "üzerinde mi olacak?" if yon.lower() == "above" else "altında mı olacak?"
-        return f"{subj.strip().title()} fiyatı {tr_tarih(tarih)} tarihinde ${sayi} {yw}"
-    m = re.match(
-        r"what will the price of\s+(.+?)\s+be\s+(on|in)\s+(.+?)\??$",
-        s, re.IGNORECASE)
-    if m:
-        subj, _, tarih = m.groups()
-        return f"{subj.strip().title()} fiyatı {tr_tarih(tarih)} ne olacak?"
-    return s
-
-
-def best_prices(m: dict) -> str:
-    """outcomePrices: ["0.62","0.38"] + outcomes: ["Yes","No"] -> 'Evet %62 / Hayır %38'"""
-    try:
-        outs = m.get("outcomes")
-        prcs = m.get("outcomePrices")
-        import json
-        if isinstance(outs, str):
-            outs = json.loads(outs)
-        if isinstance(prcs, str):
-            prcs = json.loads(prcs)
-        return " / ".join(f"{tr_outcome(o)} {pct(p)}" for o, p in zip(outs, prcs))
-    except Exception:
-        return "-"
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Polymarket TR Radar'a hos geldin.\n\n"
-        "/gundem - en yuksek hacimli 10 KRIPTO market (Turkce)\n"
-        "/balina - en yuksek hacimli kripto markette 10k$+ islemler\n"
-        "/takip BTC ETH SOL - sectiklerine otomatik alarm (15 dk)\n"
-        "/listem - takip listen\n"
-        "/acikla - oran nasil okunur?\n"
-        f"{DISCLAIMER}"
-    )
-
-
-import re
-
-# Tam kelime eslesmesi (...\b...): "nomination"daki "ton", "whether"daki "eth",
-# "resolution"daki "sol" gibi sahte eslesmeler engellenir.
-CRYPTO_RE = re.compile(
-    r"\b(bitcoin|btc|ethereum|eth|solana|crypto|kripto|xrp|ripple|doge|dogecoin|"
-    r"cardano|avalanche|avax|chainlink|polygon|matic|arbitrum|optimism|uniswap|"
-    r"litecoin|polkadot|near|aptos|sui|sei|pepe|shib|bnb|tron|toncoin|fartcoin|"
-    r"microstrategy|coinbase|binance)\b"
-    r"|\$\s?\d",
-    re.IGNORECASE,
-)
-
-# Bunlar gecerse kripto degildir (etiket crypto demedikce).
-BLOCK_RE = re.compile(
-    r"(nomination|presidential|election|senate|governor|mayor|democrat|republican|"
-    r"putin|xi jinping|pope|oscar|emmy|nfl|nba|super bowl|fed\b|interest rate)",
-    re.IGNORECASE,
-)
-
-
-def _tag_slugs(m: dict) -> str:
-    """tags/categories alanini duzgun parse et, ham JSON copune bakma."""
-    parts = []
-    for key in ("tags", "categories"):
-        v = m.get(key)
-        if isinstance(v, list):
-            for t in v:
-                if isinstance(t, dict):
-                    parts.append(str(t.get("slug", "")))
-                    parts.append(str(t.get("label", "")))
-                    parts.append(str(t.get("name", "")))
-                else:
-                    parts.append(str(t))
-        elif v:
-            parts.append(str(v))
-    return " ".join(parts)
-
-
-def is_crypto(m: dict) -> bool:
-    # API zaten crypto etiketiyle verdiyse sorgusuz kabul (siyaset-kripto kesisimleri
-    # "Trump crypto reserve" gibi sorular BLOCK_RE'ye takilmamali).
-    tags = _tag_slugs(m).lower()
-    if re.search(r"\bcrypto\b", tags):
+def cd_ok(s: dict, anahtar: str, simdi: int, sure: int = COOLDOWN) -> bool:
+    if simdi - s["cd"].get(anahtar, 0) >= sure:
+        s["cd"][anahtar] = simdi
         return True
-    if re.search(r"\b(bitcoin|ethereum)\b", tags):
-        return True
-    q = f"{m.get('question', '')} {m.get('slug', '')} {m.get('groupItemTitle', '')}"
-    if BLOCK_RE.search(q):
-        return False
-    return bool(CRYPTO_RE.search(q))
-
-
-async def fetch_crypto_markets(c) -> list:
-    """Crypto(21) + Bitcoin(100196) + Ethereum(100383) etiketlerinden hacim
-    sirali cek, conditionId/slug ile tekillestir. Olmazsa eski tarama."""
-    # 1) Dogru yol: tag + hacim sirasi (birden fazla etiket)
-    birlesik: dict = {}
-    for tag in (21, 100196, 100383):
-        for params in (
-            {"tag_id": tag, "order": "volume24hr", "ascending": "false",
-             "active": "true", "closed": "false", "limit": 100},
-            {"tag_id": tag, "active": "true", "closed": "false", "limit": 200},
-        ):
-            try:
-                r = await c.get(f"{GAMMA}/markets", params=params)
-                r.raise_for_status()
-                data = r.json()
-                if isinstance(data, list) and data:
-                    for m in data:
-                        key = m.get("conditionId") or m.get("slug")
-                        if key and key not in birlesik:
-                            birlesik[key] = m
-                    break
-            except Exception as e:
-                log.warning("crypto tag fetch hata %s: %s", params, e)
-    if birlesik:
-        return list(birlesik.values())
-    # 2) Yedek: genel tarama + offset'li sayfalama + lokal filtre
-    out = []
-    for offset in (0, 200, 400):
-        try:
-            r = await c.get(f"{GAMMA}/markets", params={
-                "closed": "false", "limit": 200, "offset": offset})
-            r.raise_for_status()
-            data = r.json()
-            if not isinstance(data, list) or not data:
-                break
-            out.extend(data)
-            if len(data) < 200:
-                break
-        except Exception as e:
-            log.warning("genel tarama hata offset=%s: %s", offset, e)
-            break
-    return out
-
-
-def konu(m: dict) -> str:
-    """Cesitlilik icin marketin konusu: bitcoin / ethereum / diger coin / diger."""
-    q = f"{m.get('question', '')} {m.get('slug', '')}".lower()
-    if "bitcoin" in q or re.search(r"\bbtc\b", q):
-        return "bitcoin"
-    if "ethereum" in q or re.search(r"\beth\b", q):
-        return "ethereum"
-    return "altcoin"
-
-
-def _vol(m: dict) -> float:
-    try:
-        return float(m.get("volume24hr") or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
-def cesitlendir(markets: list, adet: int = 10) -> list:
-    """Hacme gore sirali listeden BTC'yi en fazla 4 al, kalan kontenjani
-    altcoin/ethereum ile doldur. Hepsi BTC olmasin."""
-    sirali = sorted(markets, key=_vol, reverse=True)
-    secilen, btc = [], 0
-    for m in sirali:
-        if konu(m) == "bitcoin":
-            if btc >= 4:
-                continue
-            btc += 1
-        secilen.append(m)
-        if len(secilen) >= adet:
-            break
-    # Kontenjan dolmazsa BTC kisitini kaldirip tamamla
-    if len(secilen) < adet:
-        ids = {id(m) for m in secilen}
-        for m in sirali:
-            if id(m) not in ids:
-                secilen.append(m)
-                if len(secilen) >= adet:
-                    break
-    return secilen
-
-
-async def gundem(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Kripto gundemi cekiyorum...")
-    try:
-        async with make_client() as c:
-            markets = await fetch_crypto_markets(c)
-            if not isinstance(markets, list) or not markets:
-                await update.message.reply_text(
-                    "API su an bosa dondu. 1 dk sonra tekrar dene." + DISCLAIMER
-                )
-                return
-    except Exception as e:
-        log.exception("gamma hata")
-        await update.message.reply_text(f"Veri alinamadi: {e}")
-        return
-
-    # volume24hr'a gore sirala
-    def vol(m):
-        try:
-            return float(m.get("volume24hr") or 0)
-        except (TypeError, ValueError):
-            return 0
-
-    crypto = [m for m in markets if is_crypto(m)] or markets
-    log.info("gamma: toplam %d market, kripto filtre %d", len(markets), len([m for m in markets if is_crypto(m)]))
-    top = cesitlendir(crypto, 10)
-    lines = ["<b>KRIPTO GUNDEM (24s hacme gore)</b>"]
-    import asyncio
-    for i, m in enumerate(top, 1):
-        raw_q = str(m.get("question", "-"))[:200]
-        lokal = tr_question(raw_q)
-        if lokal != raw_q:
-            tr_q = lokal
-        else:
-            tr_q = await asyncio.to_thread(tr_sync, raw_q)
-        q = html.escape(tr_q[:170])
-        slug = m.get("slug", "")
-        link = f"https://polymarket.com/market/{slug}" if slug else "-"
-        lines.append(
-            f"\n{i}. {q}\n"
-            f"   {html.escape(best_prices(m))} | 24s: {fmt_usd(m.get('volume24hr'))} | lik: {fmt_usd(m.get('liquidityNum'))}\n"
-            f"   {link}"
-        )
-    lines.append(DISCLAIMER)
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
-
-
-async def balina(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cond = context.args[0].strip() if context.args else None
-    if not cond:
-        # conditionId verilmemisse: en yuksek hacimli KRIPTO marketi bul
-        await update.message.reply_text("En yuksek hacimli kripto market bulunuyor...")
-        try:
-            async with make_client() as c:
-                markets = await fetch_crypto_markets(c)
-            def vol(m):
-                try:
-                    return float(m.get("volume24hr") or 0)
-                except (TypeError, ValueError):
-                    return 0
-            filt = [m for m in markets if is_crypto(m)] or markets
-            crypto = sorted(filt, key=vol, reverse=True)
-            if not crypto:
-                await update.message.reply_text("Su an kripto market bulunamadi." + DISCLAIMER)
-                return
-            top = crypto[0]
-            cond = top.get("conditionId")
-            q = top.get("question", "-")
-        except Exception as e:
-            await update.message.reply_text(f"Market bulunamadi: {e}")
-            return
-    else:
-        q = cond
-
-    await update.message.reply_text(f"Balina islemler taraniyor...\n{q}")
-    try:
-        async with make_client() as c:
-            r = await c.get(f"{DATA_API}/trades", params={"market": cond, "limit": 100})
-            r.raise_for_status()
-            trades = r.json()
-    except Exception as e:
-        await update.message.reply_text(f"Islem verisi alinamadi: {e}")
-        return
-
-    big = []
-    for t in trades:
-        try:
-            size = float(t.get("size") or 0)
-            price = float(t.get("price") or 0)
-            usd = size * price
-        except (TypeError, ValueError):
-            continue
-        if usd >= 10_000:
-            big.append((usd, t))
-    big.sort(reverse=True, key=lambda x: x[0])
-    big = big[:10]
-
-    if not big:
-        await update.message.reply_text(
-            "Son 100 islemde 10k$+ balina islem yok. Daha sakin market." + DISCLAIMER
-        )
-        return
-
-    lines = [f"<b>BALINA ({html.escape(tr_question(str(q))[:120])})</b>"]
-    for usd, t in big:
-        side = html.escape(tr_outcome(t.get("side", "-")))
-        out = html.escape(tr_outcome(t.get("outcome", "-")))
-        ts = t.get("timestamp")
-        try:
-            dt = datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%m-%d %H:%M UTC")
-        except (TypeError, ValueError):
-            dt = "-"
-        lines.append(f"\n{fmt_usd(usd)} {side} {out} @ {t.get('price')} | {dt}")
-    lines.append(DISCLAIMER)
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-
-
-async def acikla(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Oran nasil okunur?\n\n"
-        "Evet %62 = piyasa o sonucun %62 ihtimal verdigini dusunuyor demek. "
-        "Fiyat 0.62$ ise dogru bilirsen 1$ alirsin.\n\n"
-        "3 kural:\n"
-        "1. Yuksek oran = yuksek beklenti, dusuk kazanc.\n"
-        "2. Hacmi dusuk markette fiyat kolay oynar, aldanma.\n"
-        "3. Kaybedecegin parayla oynama, bu kumar sayilabilir.\n"
-        f"{DISCLAIMER}"
-    )
-
-
-COIN_ALIASES = {
-    "BTC": ["bitcoin", "btc"], "ETH": ["ethereum", "eth"],
-    "SOL": ["solana", "sol"], "XRP": ["xrp", "ripple"],
-    "DOGE": ["doge", "dogecoin"], "ADA": ["cardano", "ada"],
-    "AVAX": ["avax", "avalanche"], "LINK": ["chainlink", "link"],
-    "BNB": ["bnb"], "TON": ["toncoin"], "TRX": ["tron", "trx"],
-    "DOT": ["polkadot", "dot"], "MATIC": ["matic", "polygon"],
-    "ARB": ["arbitrum", "arb"], "OP": ["optimism"],
-    "UNI": ["uniswap", "uni"], "LTC": ["litecoin", "ltc"],
-    "NEAR": ["near"], "APT": ["aptos", "apt"], "SUI": ["sui"],
-    "SEI": ["sei"], "PEPE": ["pepe"], "SHIB": ["shib"],
-    "FARTCOIN": ["fartcoin"],
-}
-
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
-ALARM_ESIK_PUAN = 10  # oran degisimi >=10 puan -> alarm
-BALINA_ESIK = 10000  # $ alarm esigi
-
-
-def state_yukle() -> dict:
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            s = json.load(f)
-            if isinstance(s, dict):
-                s.setdefault("chats", {})
-                s.setdefault("seen", {})
-                s.setdefault("last_check", 0)
-                return s
-    except (FileNotFoundError, ValueError):
-        pass
-    except Exception as e:
-        log.warning("state okuma hata: %s", e)
-    return {"chats": {}, "seen": {}, "last_check": 0}
-
-
-def state_kaydet(s: dict):
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(s, f, ensure_ascii=False)
-    except Exception as e:
-        log.warning("state yazma hata: %s", e)
-
-
-def coinTemizle(hams: list) -> list:
-    out = []
-    for c in hams:
-        c = "".join(ch for ch in c.upper() if ch.isalnum())
-        if 2 <= len(c) <= 10 and c not in out:
-            out.append(c)
-    return out[:10]
-
-
-def coin_eslesme(m: dict, coin: str) -> bool:
-    takma = COIN_ALIASES.get(coin, [coin.lower()])
-    q = f"{m.get('question', '')} {m.get('slug', '')}"
-    for a in takma:
-        if re.search(r"\b" + re.escape(a) + r"\b", q, re.IGNORECASE):
-            return True
     return False
 
 
-def ilk_oran(m: dict):
+# --- Binance okuma ---
+async def bnc(c: httpx.AsyncClient, yol: str, params: dict):
+    r = await c.get(f"{FAPI}{yol}", params=params)
+    r.raise_for_status()
+    return r.json()
+
+
+def mum_degisim(mumlar, adet: int):
+    """Son kapanmis `adet` mumun yuzde degisimi (acilis ilk -> kapanis son)."""
     try:
-        prcs = m.get("outcomePrices")
-        import json as _j
-        if isinstance(prcs, str):
-            prcs = _j.loads(prcs)
-        return float(prcs[0])
-    except (TypeError, ValueError, IndexError, KeyError):
+        kapali = [m for m in mumlar if len(m) > 4]
+        if len(kapali) < adet + 1:
+            return None
+        ilk_ac = float(kapali[-(adet + 1)][1])
+        son_kap = float(kapali[-1][4])
+        return (son_kap - ilk_ac) / ilk_ac * 100
+    except (TypeError, ValueError, IndexError):
         return None
+
+
+async def sembol_verisi(c: httpx.AsyncClient, sym: str) -> dict:
+    v = {"sym": sym}
+    try:
+        v["m15"] = await bnc(c, "/fapi/v1/klines", {"symbol": sym, "interval": "15m", "limit": 5})
+    except Exception as e:
+        log.warning("%s m15 hata: %s", sym, e)
+        v["m15"] = []
+    try:
+        v["h1"] = await bnc(c, "/fapi/v1/klines", {"symbol": sym, "interval": "1h", "limit": 14})
+    except Exception as e:
+        log.warning("%s h1 hata: %s", sym, e)
+        v["h1"] = []
+    try:
+        fr = await bnc(c, "/fapi/v1/fundingRate", {"symbol": sym, "limit": 1})
+        v["fon"] = float(fr[0]["fundingRate"]) if fr else None
+    except Exception:
+        v["fon"] = None
+    try:
+        oi = await bnc(c, "/fapi/v1/openInterest", {"symbol": sym})
+        v["oi"] = float(oi.get("openInterest", 0))
+    except Exception:
+        v["oi"] = None
+    try:
+        ls = await bnc(c, "/futures/data/globalLongShortAccountRatio",
+                       {"symbol": sym, "period": "15m", "limit": 2})
+        v["ls"] = float(ls[-1]["longShortRatio"]) if ls else None
+    except Exception:
+        v["ls"] = None
+    try:
+        dp = await bnc(c, "/fapi/v1/depth", {"symbol": sym, "limit": 20})
+        bid = sum(float(b[1]) * float(b[0]) for b in dp.get("bids", []))
+        ask = sum(float(a[1]) * float(a[0]) for a in dp.get("asks", []))
+        v["defter"] = (bid / ask) if ask > 0 else None
+    except Exception:
+        v["defter"] = None
+    try:
+        v["lik"] = await bnc(c, "/fapi/v1/forceOrders", {"symbol": sym, "limit": 100})
+    except Exception as e:
+        log.warning("%s lik hata: %s", sym, e)
+        v["lik"] = []
+    try:
+        v["trd"] = await bnc(c, "/fapi/v1/aggTrades", {"symbol": sym, "limit": 100})
+    except Exception:
+        v["trd"] = []
+    try:
+        mk = await bnc(c, "/fapi/v1/premiumIndex", {"symbol": sym})
+        v["mark"] = float(mk.get("markPrice", 0)) or None
+    except Exception:
+        v["mark"] = None
+    return v
+
+
+def analiz(coin: str, v: dict, snap: dict, simdi: int, ilk_tarama: bool) -> list:
+    """Veriden alarm listesi uret. Ilk taramada sadece kayit, alarm yok."""
+    out = []
+    major = coin in MAJOR
+
+    d15 = mum_degisim(v.get("m15", []), 1)
+    d60 = mum_degisim(v.get("h1", []), 4)
+
+    # OI degisimi: snap'teki ~1 saat oncesine gore
+    oi = v.get("oi")
+    oi_gecmis = snap.get("oi_tarihce", [])
+    oi_deg = None
+    if oi and len(oi_gecmis) >= 4 and oi_gecmis[-4]:
+        oi_deg = (oi - oi_gecmis[-4]) / oi_gecmis[-4] * 100
+    if oi:
+        oi_gecmis = (oi_gecmis + [oi])[-8:]
+    snap["oi_tarihce"] = oi_gecmis
+
+    # Son fiyat (hassas esik karsilastirmasi icin)
+    try:
+        son_fiyat = float(v["h1"][-1][4]) if v.get("h1") else None
+    except (TypeError, ValueError, IndexError):
+        son_fiyat = None
+    snap["fiyat"] = son_fiyat
+
+    if ilk_tarama:
+        snap["d15"] = d15
+        snap["d60"] = d60
+        return out
+
+    esik15 = ESIK_15M_MAJOR if major else ESIK_15M_ALT
+    if d15 is not None and abs(d15) >= esik15:
+        out.append(("fiyat15", f"HIZ [{coin}] 15 dkda %{d15:+.1f}"))
+    if d60 is not None and abs(d60) >= ESIK_1S:
+        out.append(("fiyat60", f"HAREKET [{coin}] 1 saatte %{d60:+.1f}"))
+
+    # Likidasyon: son 15 dk toplami + long/short ayrimi (mark fiyata gore)
+    pencere = simdi * 1000 - 15 * 60 * 1000
+    top_lik = long_lik = short_lik = 0.0
+    for o in v.get("lik", []) or []:
+        try:
+            ts = int(o.get("time", 0))
+            if ts < pencere:
+                continue
+            usd = float(o.get("price", 0)) * float(o.get("origQty", 0))
+            top_lik += usd
+            if v.get("mark"):
+                if float(o.get("price", 0)) < v["mark"]:
+                    long_lik += usd
+                else:
+                    short_lik += usd
+        except (TypeError, ValueError):
+            continue
+    if top_lik >= ESIK_LIK_15M:
+        out.append(("lik", f"LIKIDASYON [{coin}] 15 dkda {fmt_usd(top_lik)} "
+                           f"(long {fmt_usd(long_lik)} / short {fmt_usd(short_lik)})"))
+
+    fon = v.get("fon")
+    if fon is not None and abs(fon) >= ESIK_FON:
+        yon = "long kalabaligi" if fon > 0 else "short kalabaligi"
+        out.append(("fon", f"FONLAMA [{coin}] %{fon*100:.3f} — {yon}, ters hareket riski"))
+
+    if oi_deg is not None and abs(oi_deg) >= ESIK_OI_1S:
+        yatay = d60 is not None and abs(d60) < 1.0
+        ek = " + fiyat yatay = pozisyon birikiyor, patlama yakin" if yatay else ""
+        out.append(("oi", f"OI [{coin}] 1 saatte %{oi_deg:+.1f}{ek}"))
+
+    ls = v.get("ls")
+    if ls is not None and (ls >= ESIK_LS_YUKSEK or ls <= ESIK_LS_DUSUK):
+        out.append(("ls", f"L/S [{coin}] oran {ls:.2f} — kalabalik tek tarafta, sert ters mum riski"))
+
+    dft = v.get("defter")
+    if dft is not None and (dft >= ESIK_DEFTER or dft <= 1 / ESIK_DEFTER):
+        taraf = "altta alis duvari" if dft >= ESIK_DEFTER else "ustte satis duvari"
+        out.append(("defter", f"DEFTER [{coin}] bid/ask {dft:.1f}x — {taraf} (spoof olabilir)"))
+
+    # Volatilite sikismasi: son kapanmis 1s mumu, onceki 12'nin en dari mi?
+    try:
+        araliklar = []
+        for m in v.get("h1", [])[-13:-1]:
+            araliklar.append((float(m[2]) - float(m[3])) / float(m[4]) * 100)
+        if araliklar:
+            son = araliklar[-1]
+            if son <= min(araliklar) * 1.05 and son > 0:
+                out.append(("squeeze", f"SIKISMA [{coin}] 1s bant son 12 saatin en dari (%{son:.2f}) — breakout yakin"))
+    except (TypeError, ValueError, IndexError):
+        pass
+
+    # Blok islem: son 100 aggTrade'de $250K+ tekil
+    blok = 0.0
+    for t in v.get("trd", []) or []:
+        try:
+            usd = float(t.get("p", 0)) * float(t.get("q", 0))
+            if usd >= ESIK_BLOK and usd > blok:
+                blok = usd
+        except (TypeError, ValueError):
+            continue
+    if blok:
+        out.append(("blok", f"BLOK [{coin}] tek kalemde {fmt_usd(blok)} emir"))
+
+    snap["d15"] = d15
+    snap["d60"] = d60
+    return out
+
+
+# --- komutlar ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Coin Radari'na hos geldin.\n\n"
+        "/takip BTC ETH SOL - sectiklerine otomatik alarm (15 dk)\n"
+        "/durum - takip ettiklerinin anlik ozeti\n"
+        "/listem - takip listen\n"
+        "/birak BTC - takipten cikar\n\n"
+        "Alarmlar: hizli fiyat, likidasyon, fonlama, OI, L/S, defter, sikisma, blok islem."
+        + DISCLAIMER)
 
 
 async def takip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = str(update.effective_chat.id)
-    coinler = coinTemizle(context.args)
-    if not coinler:
+    girilen = []
+    for c in context.args:
+        c = "".join(ch for ch in c.upper() if ch.isalnum())
+        if c in DESTEKLENEN and c not in girilen:
+            girilen.append(c)
+    if not girilen:
         await update.message.reply_text(
-            "Kullanim: /takip BTC ETH SOL\nBildigin coin sembollerini yaz, 15 dakikada bir kontrol edip degisiklikte mesaj atarim.")
+            "Kullanim: /takip BTC ETH SOL\nDesteklenen: " + ", ".join(DESTEKLENEN))
         return
     s = state_yukle()
     mevcut = s["chats"].get(cid, [])
-    for c in coinler:
+    for c in girilen:
         if c not in mevcut:
             mevcut.append(c)
-    s["chats"][cid] = mevcut[:10]
+    s["chats"][cid] = [c for c in mevcut if c in DESTEKLENEN][:10]
     state_kaydet(s)
     await update.message.reply_text(
-        f"Takip basladi: {', '.join(mevcut)}\n"
-        "15 dakikada bir kontrol edecegim: yeni market, 10k$+ balina, 10+ puan oran degisimi.\n"
-        "Birakmak icin: /birak BTC  |  Liste: /listem" + DISCLAIMER)
+        f"Takip basladi: {', '.join(s['chats'][cid])}\n"
+        "15 dakikada bir kontrol edip onemliyse yazacagim.\n"
+        "Anlik ozet: /durum" + DISCLAIMER)
 
 
 async def birak(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = str(update.effective_chat.id)
     s = state_yukle()
-    mevcut = s["chats"].get(cid, [])
     if not context.args:
         await update.message.reply_text("Kullanim: /birak BTC  veya  /birak hepsi")
         return
     if context.args[0].lower() in ("hepsi", "all", "temizle"):
         s["chats"][cid] = []
     else:
-        sil = {c.upper() for c in context.args}
-        s["chats"][cid] = [c for c in mevcut if c not in sil]
+        sil = {"".join(ch for ch in c.upper() if ch.isalnum()) for c in context.args}
+        s["chats"][cid] = [c for c in s["chats"].get(cid, []) if c not in sil]
     state_kaydet(s)
     await update.message.reply_text(f"Guncel liste: {', '.join(s['chats'][cid]) or '(bos)'}")
 
@@ -555,92 +345,91 @@ async def listem(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Ekle: /takip BTC ETH")
 
 
-async def alarm_kontrol(context: ContextTypes.DEFAULT_TYPE):
-    """15 dakikada bir: yeni market + oran degisimi + balina -> push mesaji."""
+async def durum(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cid = str(update.effective_chat.id)
     s = state_yukle()
-    aktif = {cid: coins for cid, coins in s["chats"].items() if coins}
-    if not aktif:
+    coins = s["chats"].get(cid, [])
+    if not coins:
+        await update.message.reply_text("Liste bos. Ornek: /takip BTC ETH SOL")
         return
-    sessiz = not s.get("last_check")
+    await update.message.reply_text("Anlik ozet cekiliyor...")
     try:
         async with make_client() as c:
-            markets = await fetch_crypto_markets(c)
+            satirlar = []
+            for coin in coins[:10]:
+                try:
+                    v = await sembol_verisi(c, sembol(coin))
+                except Exception as e:
+                    satirlar.append(f"{coin}: alinamadi ({e})")
+                    continue
+                d15 = mum_degisim(v.get("m15", []), 1)
+                d60 = mum_degisim(v.get("h1", []), 4)
+                fon = v.get("fon")
+                parca = [coin]
+                parca.append(f"15dk %{d15:+.1f}" if d15 is not None else "15dk -")
+                parca.append(f"1s %{d60:+.1f}" if d60 is not None else "1s -")
+                parca.append(f"fon %{fon*100:.3f}" if fon is not None else "fon -")
+                if v.get("ls") is not None:
+                    parca.append(f"L/S {v['ls']:.2f}")
+                satirlar.append(" | ".join(parca))
+            await update.message.reply_text("\n".join(satirlar) + DISCLAIMER)
+    except Exception as e:
+        await update.message.reply_text(f"Ozet alinamadi: {e}")
+
+
+async def alarm_kontrol(context: ContextTypes.DEFAULT_TYPE):
+    simdi = int(time.time())
+    s = state_yukle()
+    aktif = {cid: [c for c in coins if c in DESTEKLENEN]
+             for cid, coins in s["chats"].items() if coins}
+    if not aktif:
+        return
+    ilk = not s.get("last_check")
+    try:
+        async with make_client() as c:
+            veriler = {}
+            for coin in sorted({c for coins in aktif.values() for c in coins}):
+                try:
+                    veriler[coin] = await sembol_verisi(c, sembol(coin))
+                except Exception as e:
+                    log.warning("%s veri hata: %s", coin, e)
     except Exception as e:
         log.warning("alarm fetch hata: %s", e)
         return
-    if not isinstance(markets, list) or not markets:
-        return
-
-    tum_coinler = sorted({c for coins in aktif.values() for c in coins})
-    coin_market = {}
-    for coin in tum_coinler:
-        eslesen = [m for m in markets if coin_eslesme(m, coin)]
-        coin_market[coin] = sorted(eslesen, key=_vol, reverse=True)[:5]
 
     for cid, coins in aktif.items():
         uyari = []
         for coin in coins:
-            for m in coin_market.get(coin, []):
-                mid = m.get("conditionId") or m.get("slug")
-                if not mid:
-                    continue
-                kayit = s["seen"].get(mid)
-                simdi = ilk_oran(m)
-                if kayit is None:
-                    s["seen"][mid] = {"q": str(m.get("question", ""))[:120], "p": simdi}
-                    if not sessiz:
-                        uyari.append(f"YENI [{coin}] {tr_question(str(m.get('question', '')))[:120]}")
-                elif simdi is not None and kayit.get("p") is not None:
-                    fark = abs(simdi - kayit["p"]) * 100
-                    if fark >= ALARM_ESIK_PUAN:
-                        uyari.append(
-                            f"ORAN [{coin}] %{kayit['p']*100:.0f} -> %{simdi*100:.0f}: "
-                            f"{tr_question(str(m.get('question', '')))[:110]}")
-                        kayit["p"] = simdi
-        # Balina: her coin'in en hacimli marketinde son kontrol sonrasi 10k$+ islem
-        try:
-            async with make_client() as c2:
-                for coin in coins:
-                    top = coin_market.get(coin, [])
-                    if not top:
-                        continue
-                    mid = top[0].get("conditionId")
-                    if not mid:
-                        continue
-                    r = await c2.get(f"{DATA_API}/trades",
-                                     params={"market": mid, "limit": 20})
-                    r.raise_for_status()
-                    for t in r.json():
-                        try:
-                            usd = float(t.get("size") or 0) * float(t.get("price") or 0)
-                            ts = int(t.get("timestamp") or 0)
-                        except (TypeError, ValueError):
-                            continue
-                        if usd >= BALINA_ESIK and ts > s.get("last_check", 0):
-                            uyari.append(
-                                f"BALINA [{coin}] {fmt_usd(usd)} {tr_outcome(t.get('side','-'))} "
-                                f"{tr_outcome(t.get('outcome','-'))} @ {t.get('price')}")
-                            if len([u for u in uyari if u.startswith("BALINA")]) >= 4:
-                                break
-        except Exception as e:
-            log.warning("alarm balina hata: %s", e)
-        if uyari and not sessiz:
-            mesaj = "\n\n".join(uyari[:6])
-            if len(uyari) > 6:
-                mesaj += f"\n\n(+{len(uyari)-6} uyari daha)"
-            try:
-                await context.bot.send_message(chat_id=int(cid), text=mesaj + DISCLAIMER)
-            except Exception as e:
-                log.warning("alarm gonderme hata %s: %s", cid, e)
-    s["last_check"] = int(time.time())
+            v = veriler.get(coin)
+            if not v:
+                continue
+            snap = s["snap"].get(coin, {})
+            for tip, mesaj in analiz(coin, v, snap, simdi, ilk):
+                if tip == "squeeze":
+                    if cd_ok(s, f"{coin}:{tip}", simdi, 6 * 3600):
+                        uyari.append(mesaj)
+                elif cd_ok(s, f"{coin}:{tip}", simdi):
+                    uyari.append(mesaj)
+            s["snap"][coin] = snap
+        if uyari and not ilk:
+            if gece_mi():
+                uyari = [u for u in uyari
+                         if u.startswith("LIKIDASYON") or u.startswith("HAREKET")]
+            if uyari:
+                mesaj = "\n\n".join(uyari[:6])
+                if len(uyari) > 6:
+                    mesaj += f"\n\n(+{len(uyari)-6} uyari daha)"
+                try:
+                    await context.bot.send_message(chat_id=int(cid), text=mesaj + DISCLAIMER)
+                except Exception as e:
+                    log.warning("alarm gonderme hata %s: %s", cid, e)
+    s["last_check"] = simdi
     state_kaydet(s)
 
 
 def main():
     if not TOKEN:
         raise SystemExit("TELEGRAM_BOT_TOKEN yok. .env dosyasina yaz: TELEGRAM_BOT_TOKEN=xxx")
-    # Koyeb/Render free web service saglik kontrolu icin mini HTTP server
-    # Platform PORT verir, yoksa 8080. / ve /health -> 200 OK doner.
     port = int(os.getenv("PORT", "8080"))
 
     class Health(BaseHTTPRequestHandler):
@@ -661,12 +450,10 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("gundem", gundem))
-    app.add_handler(CommandHandler("balina", balina))
-    app.add_handler(CommandHandler("acikla", acikla))
     app.add_handler(CommandHandler("takip", takip))
     app.add_handler(CommandHandler("birak", birak))
     app.add_handler(CommandHandler("listem", listem))
+    app.add_handler(CommandHandler("durum", durum))
     if app.job_queue is None:
         log.warning("job_queue yok (apscheduler kurulmamis olabilir) - alarmlar calismaz!")
     else:
