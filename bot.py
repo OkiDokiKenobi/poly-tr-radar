@@ -90,10 +90,57 @@ OUT_TR = {
     "yes": "Evet", "no": "Hayır",
     "up": "Yukarı", "down": "Aşağı",
     "over": "Üst", "under": "Alt",
+    "buy": "ALIŞ", "sell": "SATIŞ",
 }
 
 def tr_outcome(o: str) -> str:
     return OUT_TR.get(str(o).strip().lower(), str(o))
+
+
+AYLAR = {
+    "january": "Ocak", "february": "Şubat", "march": "Mart", "april": "Nisan",
+    "may": "Mayıs", "june": "Haziran", "july": "Temmuz", "august": "Ağustos",
+    "september": "Eylül", "october": "Ekim", "november": "Kasım", "december": "Aralık",
+}
+
+def tr_tarih(s: str) -> str:
+    t = (s or "").strip().rstrip("?")
+    for en, tr in AYLAR.items():
+        t = re.sub(en, tr, t, flags=re.IGNORECASE)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def tr_question(q: str) -> str:
+    """Kripto tahmin sorularini kalip-eslesmeyle yerelde Turkcelestir (kotasiz).
+    Eslesmezse API cevirisine duser (senkron cagrilamaz -> orijinali dondur)."""
+    s = (q or "").strip()
+    m = re.match(
+        r"will\s+(.+?)\s+(reach|hit)\s+\$\s?([\d,\.]+)\s+(by|in|on)\s+(.+?)\??$",
+        s, re.IGNORECASE)
+    if m:
+        subj, _, sayi, _, tarih = m.groups()
+        return f"{subj.strip().title()} {tr_tarih(tarih)} itibarıyla ${sayi} seviyesine ulaşacak mı?"
+    m = re.match(
+        r"will\s+(.+?)\s+dip to\s+\$\s?([\d,\.]+)\s+by\s+(.+?)\??$",
+        s, re.IGNORECASE)
+    if m:
+        subj, sayi, tarih = m.groups()
+        return f"{subj.strip().title()} {tr_tarih(tarih)} itibarıyla ${sayi} seviyesine düşecek mi?"
+    m = re.match(
+        r"will the price of\s+(.+?)\s+be\s+(above|below)\s+\$\s?([\d,\.]+)\s+on\s+(.+?)\??$",
+        s, re.IGNORECASE)
+    if m:
+        subj, yon, sayi, tarih = m.groups()
+        yw = "üzerinde mi olacak?" if yon.lower() == "above" else "altında mı olacak?"
+        return f"{subj.strip().title()} fiyatı {tr_tarih(tarih)} tarihinde ${sayi} {yw}"
+    m = re.match(
+        r"what will the price of\s+(.+?)\s+be\s+(on|in)\s+(.+?)\??$",
+        s, re.IGNORECASE)
+    if m:
+        subj, _, tarih = m.groups()
+        return f"{subj.strip().title()} fiyatı {tr_tarih(tarih)} ne olacak?"
+    return s
 
 
 def best_prices(m: dict) -> str:
@@ -238,12 +285,15 @@ async def gundem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     crypto = sorted(crypto, key=vol, reverse=True)[:10]
     top = crypto
     lines = ["<b>KRIPTO GUNDEM (24s hacme gore)</b>"]
-    await update.message.reply_text("Basliklar Turkceye cevriliyor...")
     import asyncio
     for i, m in enumerate(top, 1):
         raw_q = str(m.get("question", "-"))[:200]
-        tr_q = await asyncio.to_thread(tr_sync, raw_q)
-        q = html.escape(tr_q[:150])
+        lokal = tr_question(raw_q)
+        if lokal != raw_q:
+            tr_q = lokal
+        else:
+            tr_q = await asyncio.to_thread(tr_sync, raw_q)
+        q = html.escape(tr_q[:170])
         slug = m.get("slug", "")
         link = f"https://polymarket.com/market/{slug}" if slug else "-"
         lines.append(
@@ -311,10 +361,10 @@ async def balina(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    lines = [f"<b>BALINA ({html.escape(str(q)[:100])})</b>"]
+    lines = [f"<b>BALINA ({html.escape(tr_question(str(q))[:120])})</b>"]
     for usd, t in big:
-        side = html.escape(str(t.get("side", "-")))
-        out = html.escape(str(t.get("outcome", "-")))
+        side = html.escape(tr_outcome(t.get("side", "-")))
+        out = html.escape(tr_outcome(t.get("outcome", "-")))
         ts = t.get("timestamp")
         try:
             dt = datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%m-%d %H:%M UTC")
